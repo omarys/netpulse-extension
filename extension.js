@@ -2,6 +2,7 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
+import NM from 'gi://NM';
 import Soup from 'gi://Soup?version=3.0';
 import St from 'gi://St';
 
@@ -11,8 +12,10 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {
+    buildNoLinkResult,
     formatLatency,
     generateDiagnosticReport,
+    hasActiveNetworkLink,
     isCancelledError,
     runDiagnostics,
 } from './diagnostics.js';
@@ -176,7 +179,7 @@ class NetPulseIndicator extends PanelMenu.Button {
         // Action buttons
         this._runNowItem = new PopupMenu.PopupMenuItem('Run Diagnostics Now');
         this._runNowItem.connect('activate', () => {
-            this._extension.triggerDiagnosticsNow();
+            this._extension.triggerDiagnosticsNow(true);
         });
         this.menu.addMenuItem(this._runNowItem);
 
@@ -259,6 +262,12 @@ export default class NetPulseExtension extends Extension {
         this._timerId = 0;
         this._copyFeedbackTimerId = 0;
         this._settingsHandlerIds = [];
+        this._sessionModeHandlerId = 0;
+        this._nmClient = null;
+        this._nmSignalIds = [];
+        this._runCancellable = null;
+        this._hasActiveLink = null;
+        this._wasScreenLocked = this._isScreenLocked();
 
         this._settings = this.getSettings();
         this._cancellable = new Gio.Cancellable();
@@ -272,22 +281,32 @@ export default class NetPulseExtension extends Extension {
         Main.panel.addToStatusArea(this.uuid, this._indicator);
 
         this._connectSettings();
-        this._scheduleTimer();
-        this.triggerDiagnosticsNow();
+        this._sessionModeHandlerId = Main.sessionMode.connect('updated', () => {
+            this._onSessionModeUpdated();
+        });
+
+        this._initNmClient();
     }
 
     disable() {
         this._isEnabled = false;
 
-        if (this._timerId !== 0) {
-            GLib.Source.remove(this._timerId);
-            this._timerId = 0;
+        if (this._sessionModeHandlerId !== 0) {
+            Main.sessionMode.disconnect(this._sessionModeHandlerId);
+            this._sessionModeHandlerId = 0;
         }
+
+        this._disconnectNmSignals();
+        this._nmClient = null;
+
+        this._stopTimer();
 
         if (this._copyFeedbackTimerId !== 0) {
             GLib.Source.remove(this._copyFeedbackTimerId);
             this._copyFeedbackTimerId = 0;
         }
+
+        this._cancelInFlightCheck();
 
         if (this._cancellable) {
             this._cancellable.cancel();
@@ -317,12 +336,145 @@ export default class NetPulseExtension extends Extension {
         this._lastResult = null;
         this._lastNotifiedSeverity = null;
         this._lastNotifiedReason = null;
+        this._hasActiveLink = null;
+        this._wasScreenLocked = false;
         this._isRunning = false;
+    }
+
+    _initNmClient() {
+        NM.Client.new_async(this._cancellable, (_obj, res) => {
+            try {
+                const client = NM.Client.new_finish(res);
+                if (!this._isEnabled)
+                    return;
+
+                this._nmClient = client;
+                this._connectNmSignals();
+                this._evaluateLinkAndPoll(true);
+            } catch (err) {
+                if (!isCancelledError(err)) {
+                    console.error('[NetPulse] Failed to initialize NM.Client:', err);
+                    if (this._isEnabled && !this._isScreenLocked()) {
+                        this._startTimer();
+                        this.triggerDiagnosticsNow();
+                    }
+                }
+            }
+        });
+    }
+
+    _connectNmSignals() {
+        if (!this._nmClient)
+            return;
+
+        this._disconnectNmSignals();
+
+        const onStateChanged = () => {
+            this._onNmStateChanged();
+        };
+
+        this._nmSignalIds.push(
+            this._nmClient.connect('notify::primary-connection', onStateChanged),
+            this._nmClient.connect('notify::connectivity', onStateChanged),
+            this._nmClient.connect('notify::networking-enabled', onStateChanged)
+        );
+    }
+
+    _disconnectNmSignals() {
+        if (this._nmClient && this._nmSignalIds.length > 0) {
+            for (const id of this._nmSignalIds)
+                this._nmClient.disconnect(id);
+        }
+        this._nmSignalIds = [];
+    }
+
+    _isScreenLocked() {
+        return Boolean(
+            Main.sessionMode?.isLocked ||
+            Main.sessionMode?.currentMode === 'unlock-dialog'
+        );
+    }
+
+    _onSessionModeUpdated() {
+        if (!this._isEnabled)
+            return;
+
+        const locked = this._isScreenLocked();
+        if (locked === this._wasScreenLocked)
+            return;
+
+        this._wasScreenLocked = locked;
+
+        if (locked) {
+            this._stopTimer();
+            this._cancelInFlightCheck();
+        } else {
+            this._evaluateLinkAndPoll(true);
+        }
+    }
+
+    _onNmStateChanged() {
+        if (!this._isEnabled || !this._nmClient || this._isScreenLocked())
+            return;
+
+        this._evaluateLinkAndPoll(false);
+    }
+
+    _evaluateLinkAndPoll(forceCheck) {
+        if (!this._isEnabled || this._isScreenLocked())
+            return;
+
+        if (this._nmClient) {
+            const nmStatus = hasActiveNetworkLink(this._nmClient);
+            if (nmStatus.available && !nmStatus.hasLink) {
+                this._enterNoLinkIdle(nmStatus);
+                return;
+            }
+
+            const wasOffline = this._hasActiveLink === false;
+            this._hasActiveLink = true;
+            this._startTimer();
+
+            if (forceCheck || wasOffline || !this._isRunning)
+                this.triggerDiagnosticsNow();
+            return;
+        }
+
+        this._hasActiveLink = null;
+        this._startTimer();
+        if (forceCheck)
+            this.triggerDiagnosticsNow();
+    }
+
+    _enterNoLinkIdle(nmStatus) {
+        this._stopTimer();
+        this._cancelInFlightCheck();
+
+        const wasAlreadyOffline = this._hasActiveLink === false;
+        this._hasActiveLink = false;
+
+        if (wasAlreadyOffline && this._lastResult?.diagnosis?.severity === 'fail')
+            return;
+
+        const result = buildNoLinkResult(nmStatus);
+        this._applyDiagnosticResult(result);
+    }
+
+    _cancelInFlightCheck() {
+        if (this._runCancellable) {
+            this._runCancellable.cancel();
+            this._runCancellable = null;
+        }
+
+        this._isRunning = false;
+        if (this._isEnabled && this._indicator)
+            this._indicator.setRunning(false);
     }
 
     _connectSettings() {
         const onIntervalChanged = this._settings.connect('changed::check-interval', () => {
-            this._scheduleTimer();
+            if (!this._isScreenLocked() && this._hasActiveLink !== false)
+                this._startTimer();
         });
 
         const onShowBadgeChanged = this._settings.connect('changed::show-latency-badge', () => {
@@ -353,18 +505,22 @@ export default class NetPulseExtension extends Extension {
         );
     }
 
-    _scheduleTimer() {
+    _stopTimer() {
         if (this._timerId !== 0) {
             GLib.Source.remove(this._timerId);
             this._timerId = 0;
         }
+    }
 
-        if (!this._isEnabled || !this._settings)
+    _startTimer() {
+        this._stopTimer();
+
+        if (!this._isEnabled || !this._settings || this._isScreenLocked() || this._hasActiveLink === false)
             return;
 
         const interval = Math.max(5, this._settings.get_int('check-interval'));
         this._timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, () => {
-            if (!this._isEnabled) {
+            if (!this._isEnabled || this._isScreenLocked() || this._hasActiveLink === false) {
                 this._timerId = 0;
                 return GLib.SOURCE_REMOVE;
             }
@@ -406,39 +562,66 @@ export default class NetPulseExtension extends Extension {
         }
     }
 
-    triggerDiagnosticsNow() {
+    _applyDiagnosticResult(result) {
+        if (!this._isEnabled || !this._indicator)
+            return;
+
+        this._lastResult = result;
+        this._indicator.updateFromResult(result);
+        this._handleOutageNotification(result);
+
+        if (this._logger) {
+            this._logger.logDiagnostic(result).catch(err => {
+                if (!isCancelledError(err))
+                    console.error('[NetPulse] Failed to write diagnostic log:', err);
+            });
+        }
+    }
+
+    triggerDiagnosticsNow(force = false) {
         if (!this._isEnabled || this._isRunning || !this._settings || !this._soupSession)
             return;
+
+        if (!force && this._isScreenLocked())
+            return;
+
+        if (!force && this._nmClient) {
+            const nmStatus = hasActiveNetworkLink(this._nmClient);
+            if (nmStatus.available && !nmStatus.hasLink) {
+                this._enterNoLinkIdle(nmStatus);
+                return;
+            }
+        }
 
         this._isRunning = true;
         this._indicator?.setRunning(true);
 
-        const config = this._readConfig();
-        const cancellable = this._cancellable;
+        const nmClient = this._nmClient;
+        const config = {
+            ...this._readConfig(),
+            nmClient,
+        };
+        const runCancellable = new Gio.Cancellable();
+        this._runCancellable = runCancellable;
         const soupSession = this._soupSession;
 
-        runDiagnostics(config, soupSession, cancellable)
+        runDiagnostics(config, soupSession, runCancellable, nmClient)
             .then(result => {
-                if (!this._isEnabled || !this._indicator)
+                if (!this._isEnabled || !this._indicator || runCancellable.is_cancelled())
                     return;
-                this._lastResult = result;
-                this._indicator.updateFromResult(result);
-                this._handleOutageNotification(result);
-                if (this._logger) {
-                    this._logger.logDiagnostic(result).catch(err => {
-                        if (!isCancelledError(err))
-                            console.error('[NetPulse] Failed to write diagnostic log:', err);
-                    });
-                }
+                this._applyDiagnosticResult(result);
             })
             .catch(err => {
                 if (!isCancelledError(err))
                     console.error('[NetPulse] Diagnostics failed:', err);
             })
             .finally(() => {
-                this._isRunning = false;
-                if (this._isEnabled && this._indicator)
-                    this._indicator.setRunning(false);
+                if (this._runCancellable === runCancellable) {
+                    this._runCancellable = null;
+                    this._isRunning = false;
+                    if (this._isEnabled && this._indicator)
+                        this._indicator.setRunning(false);
+                }
             });
     }
 

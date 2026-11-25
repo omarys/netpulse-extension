@@ -1,5 +1,6 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import NM from 'gi://NM';
 import Soup from 'gi://Soup?version=3.0';
 
 const HIGH_LATENCY_MS = 150;
@@ -224,72 +225,270 @@ function splitNmcliTerseLine(line) {
 }
 
 /**
- * Layer 1: Local Interface & Gateway check.
+ * Extract link and gateway metadata from an NM.ActiveConnection if it is
+ * a usable non-loopback connection.
  *
- * @param {Gio.Cancellable|null} cancellable
- * @returns {Promise<{status: 'pass'|'degraded'|'fail', latencyMs: number|null, detail: string, summary: string, hasInterface: boolean, gateway: string|null}>}
+ * @param {NM.ActiveConnection|null|undefined} activeConn
+ * @returns {{device: string|null, type: string|null, connection: string|null, gateway: string|null}|null}
  */
-export async function checkLocalAndGateway(cancellable = null) {
-    const [nmRes, routeRes] = await Promise.all([
-        runCommandAsync(
-            ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status'],
-            {timeoutMs: 3000, cancellable}
-        ),
-        runCommandAsync(
-            ['ip', 'route', 'show', 'default'],
-            {timeoutMs: 3000, cancellable}
-        ),
-    ]);
+function inspectActiveConnection(activeConn) {
+    if (!activeConn)
+        return null;
 
-    let activeConn = null;
-    if (nmRes.ok) {
-        const lines = nmRes.stdout.split('\n').map(l => l.trim()).filter(Boolean);
-        for (const line of lines) {
-            const [device, type, state, connection] = splitNmcliTerseLine(line);
-            if (!device || type === 'loopback' || device === 'lo')
-                continue;
-            if (state && state.toLowerCase().startsWith('connected')) {
-                activeConn = {
-                    device,
-                    type: type || 'unknown',
-                    state,
-                    connection: connection || device,
-                };
-                break;
-            }
-        }
-    }
+    const connType = activeConn.get_connection_type?.() ?? null;
+    const devices = activeConn.get_devices?.() ?? [];
+    const primaryDev = devices[0] ?? null;
+    const device = primaryDev?.get_ip_iface?.() || primaryDev?.get_iface?.() || null;
 
-    let gateway = null;
-    let routeDev = null;
-    if (routeRes.ok) {
-        const viaMatch = routeRes.stdout.match(/^default\s+via\s+(\S+)(?:\s+dev\s+(\S+))?/m);
-        if (viaMatch) {
-            gateway = viaMatch[1];
-            routeDev = viaMatch[2] || null;
-        } else {
-            const devMatch = routeRes.stdout.match(/^default\s+dev\s+(\S+)/m);
-            if (devMatch)
-                routeDev = devMatch[1];
-        }
-    }
+    if (connType === 'loopback' || device === 'lo')
+        return null;
 
-    if (!activeConn && !routeDev && !gateway) {
+    const ip4 = activeConn.get_ip4_config?.() ?? null;
+    const ip6 = activeConn.get_ip6_config?.() ?? null;
+    const state = activeConn.get_state?.();
+
+    const isActivated = state === NM.ActiveConnectionState.ACTIVATED;
+    const isActivatingWithIp = state === NM.ActiveConnectionState.ACTIVATING && Boolean(ip4 || ip6);
+    if (!isActivated && !isActivatingWithIp)
+        return null;
+
+    const gateway = ip4?.get_gateway?.() || ip6?.get_gateway?.() || null;
+    const connection = activeConn.get_id?.() || device || null;
+
+    return {
+        device,
+        type: connType,
+        connection,
+        gateway,
+    };
+}
+
+/**
+ * Inspect NetworkManager state via a shared NM.Client without spawning subprocesses.
+ *
+ * @param {NM.Client|null|undefined} nmClient
+ * @returns {{available: boolean, hasLink: boolean, device: string|null, type: string|null, connection: string|null, gateway: string|null}}
+ */
+export function hasActiveNetworkLink(nmClient) {
+    if (!nmClient) {
         return {
-            status: 'fail',
-            latencyMs: null,
-            summary: 'No active network',
-            detail: nmRes.ok
-                ? 'No connected network interface or default route'
-                : 'No default route found (nmcli unavailable)',
-            hasInterface: false,
+            available: false,
+            hasLink: true,
+            device: null,
+            type: null,
+            connection: null,
             gateway: null,
         };
     }
 
-    const ifaceLabel = activeConn
-        ? `${activeConn.device} (${activeConn.connection})`
-        : routeDev;
+    if (typeof nmClient.networking_get_enabled === 'function' && !nmClient.networking_get_enabled()) {
+        return {
+            available: true,
+            hasLink: false,
+            device: null,
+            type: null,
+            connection: null,
+            gateway: null,
+        };
+    }
+
+    const primary = inspectActiveConnection(nmClient.get_primary_connection?.());
+    if (primary) {
+        return {
+            available: true,
+            hasLink: true,
+            device: primary.device,
+            type: primary.type,
+            connection: primary.connection,
+            gateway: primary.gateway,
+        };
+    }
+
+    const activeConnections = nmClient.get_active_connections?.() ?? [];
+    let fallbackMatch = null;
+    for (const ac of activeConnections) {
+        const info = inspectActiveConnection(ac);
+        if (!info)
+            continue;
+        if (info.gateway) {
+            return {
+                available: true,
+                hasLink: true,
+                device: info.device,
+                type: info.type,
+                connection: info.connection,
+                gateway: info.gateway,
+            };
+        }
+        if (!fallbackMatch)
+            fallbackMatch = info;
+    }
+
+    if (fallbackMatch) {
+        return {
+            available: true,
+            hasLink: true,
+            device: fallbackMatch.device,
+            type: fallbackMatch.type,
+            connection: fallbackMatch.connection,
+            gateway: fallbackMatch.gateway,
+        };
+    }
+
+    return {
+        available: true,
+        hasLink: false,
+        device: null,
+        type: null,
+        connection: null,
+        gateway: null,
+    };
+}
+
+/**
+ * Build a complete diagnostic snapshot representing no active network link
+ * without spawning any subprocesses or HTTP requests.
+ *
+ * @param {{available?: boolean, hasLink?: boolean, device?: string|null, type?: string|null, connection?: string|null, gateway?: string|null}|null} [nmStatus]
+ * @param {Date} [timestamp]
+ * @returns {{timestamp: Date, layers: {local: object, wan: object, dns: object, http: object}, diagnosis: {severity: 'pass'|'degraded'|'fail', message: string, shortBadge: string}}}
+ */
+export function buildNoLinkResult(nmStatus = null, timestamp = new Date()) {
+    const local = {
+        status: 'fail',
+        latencyMs: null,
+        summary: 'No active network',
+        detail: nmStatus?.device
+            ? `${nmStatus.device} has no active network link`
+            : 'No active network connection (NetworkManager reports offline)',
+        hasInterface: false,
+        gateway: null,
+    };
+
+    const wan = {
+        status: 'fail',
+        latencyMs: null,
+        summary: 'Skipped (no link)',
+        detail: 'Skipped: no active network link',
+    };
+
+    const dns = {
+        status: 'fail',
+        latencyMs: null,
+        summary: 'Skipped (no link)',
+        detail: 'Skipped: no active network link',
+    };
+
+    const http = {
+        status: 'fail',
+        latencyMs: null,
+        summary: 'Skipped (no link)',
+        detail: 'Skipped: no active network link',
+        captivePortal: false,
+        statusCode: null,
+    };
+
+    const layers = {local, wan, dns, http};
+    const diagnosis = diagnoseLayers(layers);
+
+    return {
+        timestamp,
+        layers,
+        diagnosis,
+    };
+}
+
+/**
+ * Layer 1: Local Interface & Gateway check.
+ * Uses native NetworkManager (gi://NM) when nmClient is provided, falling back
+ * to `nmcli` + `ip route` subprocesses only when nmClient is unavailable.
+ *
+ * @param {Gio.Cancellable|null} cancellable
+ * @param {NM.Client|null} nmClient
+ * @returns {Promise<{status: 'pass'|'degraded'|'fail', latencyMs: number|null, detail: string, summary: string, hasInterface: boolean, gateway: string|null}>}
+ */
+export async function checkLocalAndGateway(cancellable = null, nmClient = null) {
+    let ifaceLabel = null;
+    let gateway = null;
+    let routeDev = null;
+
+    const nmStatus = hasActiveNetworkLink(nmClient);
+    if (nmStatus.available) {
+        if (!nmStatus.hasLink) {
+            return {
+                status: 'fail',
+                latencyMs: null,
+                summary: 'No active network',
+                detail: 'No connected network interface or default route',
+                hasInterface: false,
+                gateway: null,
+            };
+        }
+
+        gateway = nmStatus.gateway;
+        ifaceLabel = nmStatus.device && nmStatus.connection && nmStatus.connection !== nmStatus.device
+            ? `${nmStatus.device} (${nmStatus.connection})`
+            : (nmStatus.device || nmStatus.connection || 'network');
+    } else {
+        const [nmRes, routeRes] = await Promise.all([
+            runCommandAsync(
+                ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status'],
+                {timeoutMs: 3000, cancellable}
+            ),
+            runCommandAsync(
+                ['ip', 'route', 'show', 'default'],
+                {timeoutMs: 3000, cancellable}
+            ),
+        ]);
+
+        let activeConn = null;
+        if (nmRes.ok) {
+            const lines = nmRes.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+            for (const line of lines) {
+                const [device, type, state, connection] = splitNmcliTerseLine(line);
+                if (!device || type === 'loopback' || device === 'lo')
+                    continue;
+                if (state && state.toLowerCase().startsWith('connected')) {
+                    activeConn = {
+                        device,
+                        type: type || 'unknown',
+                        state,
+                        connection: connection || device,
+                    };
+                    break;
+                }
+            }
+        }
+
+        if (routeRes.ok) {
+            const viaMatch = routeRes.stdout.match(/^default\s+via\s+(\S+)(?:\s+dev\s+(\S+))?/m);
+            if (viaMatch) {
+                gateway = viaMatch[1];
+                routeDev = viaMatch[2] || null;
+            } else {
+                const devMatch = routeRes.stdout.match(/^default\s+dev\s+(\S+)/m);
+                if (devMatch)
+                    routeDev = devMatch[1];
+            }
+        }
+
+        if (!activeConn && !routeDev && !gateway) {
+            return {
+                status: 'fail',
+                latencyMs: null,
+                summary: 'No active network',
+                detail: nmRes.ok
+                    ? 'No connected network interface or default route'
+                    : 'No default route found (nmcli unavailable)',
+                hasInterface: false,
+                gateway: null,
+            };
+        }
+
+        ifaceLabel = activeConn
+            ? `${activeConn.device} (${activeConn.connection})`
+            : routeDev;
+    }
 
     if (!gateway) {
         if (routeDev) {
@@ -390,7 +589,28 @@ export async function checkWanIcmp(publicIpTarget, cancellable = null) {
 }
 
 /**
- * Layer 3: DNS Resolution check (`resolvectl query` with `getent hosts` fallback).
+ * Promise wrapper around Gio.Resolver.lookup_by_name_async.
+ *
+ * @param {Gio.Resolver} resolver
+ * @param {string} domain
+ * @param {Gio.Cancellable} cancellable
+ * @returns {Promise<Gio.InetAddress[]>}
+ */
+function lookupByNameAsync(resolver, domain, cancellable) {
+    return new Promise((resolve, reject) => {
+        resolver.lookup_by_name_async(domain, cancellable, (r, res) => {
+            try {
+                const addresses = r.lookup_by_name_finish(res);
+                resolve(addresses ?? []);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    });
+}
+
+/**
+ * Layer 3: DNS Resolution check using native async Gio.Resolver (zero subprocesses).
  *
  * @param {string} dnsTestDomain
  * @param {Gio.Cancellable|null} cancellable
@@ -407,55 +627,55 @@ export async function checkDns(dnsTestDomain, cancellable = null) {
         };
     }
 
-    const resolvectlRes = await runCommandAsync(
-        ['resolvectl', 'query', '--legend=no', domain],
-        {timeoutMs: 4000, cancellable}
-    );
+    if (cancellable?.is_cancelled()) {
+        throw new GLib.Error(
+            Gio.io_error_quark(),
+            Gio.IOErrorEnum.CANCELLED,
+            'Operation was cancelled'
+        );
+    }
 
-    if (resolvectlRes.ok && resolvectlRes.stdout.trim().length > 0) {
-        const firstLine = resolvectlRes.stdout.trim().split('\n')[0];
-        const ipMatch = firstLine.match(/:\s*([0-9a-fA-F.:]+)/);
-        const resolved = ipMatch ? ipMatch[1] : firstLine.trim();
-        const elapsedMs = Math.round(resolvectlRes.elapsedMs * 10) / 10;
+    const scoped = createScopedCancellable(cancellable, DEFAULT_CMD_TIMEOUT_MS);
+    const startUs = GLib.get_monotonic_time();
+
+    try {
+        const resolver = Gio.Resolver.get_default();
+        const addresses = await lookupByNameAsync(resolver, domain, scoped.cancellable);
+        const elapsedMs = Math.round(((GLib.get_monotonic_time() - startUs) / 1000) * 10) / 10;
+        const resolved = addresses.map(a => a.to_string()).slice(0, 3).join(', ');
+
+        if (!resolved) {
+            return {
+                status: 'fail',
+                latencyMs: null,
+                summary: 'DNS failed',
+                detail: `No addresses returned for ${domain}`,
+            };
+        }
+
         const status = elapsedMs > HIGH_LATENCY_MS ? 'degraded' : 'pass';
-
         return {
             status,
             latencyMs: elapsedMs,
             summary: `Resolved (${formatLatency(elapsedMs)})`,
-            detail: `${domain} → ${resolved} via resolvectl (${formatLatency(elapsedMs)})`,
+            detail: `${domain} → ${resolved} (${formatLatency(elapsedMs)})`,
         };
-    }
+    } catch (err) {
+        if (cancellable?.is_cancelled() || (!scoped.isTimedOut() && isCancelledError(err)))
+            throw err;
 
-    const getentRes = await runCommandAsync(
-        ['getent', 'hosts', domain],
-        {timeoutMs: 4000, cancellable}
-    );
-
-    if (getentRes.ok && getentRes.stdout.trim().length > 0) {
-        const firstLine = getentRes.stdout.trim().split('\n')[0];
-        const resolved = firstLine.split(/\s+/)[0] || firstLine;
-        const elapsedMs = Math.round(getentRes.elapsedMs * 10) / 10;
-        const status = elapsedMs > HIGH_LATENCY_MS ? 'degraded' : 'pass';
-
+        const timedOut = scoped.isTimedOut();
         return {
-            status,
-            latencyMs: elapsedMs,
-            summary: `Resolved (${formatLatency(elapsedMs)})`,
-            detail: `${domain} → ${resolved} via getent (${formatLatency(elapsedMs)})`,
+            status: 'fail',
+            latencyMs: null,
+            summary: timedOut ? 'DNS timeout' : 'DNS failed',
+            detail: timedOut
+                ? `DNS lookup for ${domain} timed out`
+                : `Failed to resolve ${domain}: ${err.message ?? String(err)}`,
         };
+    } finally {
+        scoped.cleanup();
     }
-
-    const reason = resolvectlRes.timedOut || getentRes.timedOut
-        ? `DNS lookup for ${domain} timed out`
-        : `Failed to resolve ${domain}`;
-
-    return {
-        status: 'fail',
-        latencyMs: null,
-        summary: 'DNS failed',
-        detail: reason,
-    };
 }
 
 /**
@@ -688,14 +908,16 @@ export function diagnoseLayers(layers) {
 /**
  * Execute all 4 diagnostic layers asynchronously and return the full snapshot.
  *
- * @param {{publicIpTarget: string, dnsTestDomain: string, httpEndpoint: string}} config
+ * @param {{publicIpTarget: string, dnsTestDomain: string, httpEndpoint: string, nmClient?: NM.Client|null}} config
  * @param {Soup.Session} soupSession
- * @param {Gio.Cancellable|null} cancellable
+ * @param {Gio.Cancellable|null} [cancellable]
+ * @param {NM.Client|null} [nmClient]
  * @returns {Promise<{timestamp: Date, layers: {local: object, wan: object, dns: object, http: object}, diagnosis: {severity: string, message: string, shortBadge: string}}>}
  */
-export async function runDiagnostics(config, soupSession, cancellable = null) {
+export async function runDiagnostics(config, soupSession, cancellable = null, nmClient = null) {
+    const effectiveNmClient = nmClient ?? config?.nmClient ?? null;
     const [local, wan, dns, http] = await Promise.all([
-        checkLocalAndGateway(cancellable),
+        checkLocalAndGateway(cancellable, effectiveNmClient),
         checkWanIcmp(config.publicIpTarget, cancellable),
         checkDns(config.dnsTestDomain, cancellable),
         checkHttpCaptivePortal(config.httpEndpoint, soupSession, cancellable),
