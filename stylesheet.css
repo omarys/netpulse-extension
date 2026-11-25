@@ -1,0 +1,79 @@
+/* NetPulse Outage Diagnostics Stylesheet */
+
+.netpulse-panel-box {
+    spacing: 4px;
+}
+
+.netpulse-panel-label {
+    font-size: 9.5pt;
+    font-weight: bold;
+}
+
+/* Status icon / text colors */
+.netpulse-status-pass {
+    color: #33d17a;
+}
+
+.netpulse-status-degraded {
+    color: #f6d32d;
+}
+
+.netpulse-status-fail {
+    color: #e01b24;
+}
+
+.netpulse-status-unknown {
+    color: #9a9996;
+}
+
+/* Summary banner in popup menu */
+.netpulse-banner {
+    padding: 10px 14px;
+    margin: 6px 10px;
+    border-radius: 8px;
+    font-weight: bold;
+    text-align: center;
+}
+
+.netpulse-banner-pass {
+    background-color: rgba(51, 209, 122, 0.18);
+    color: #33d17a;
+    border: 1px solid rgba(51, 209, 122, 0.4);
+}
+
+.netpulse-banner-degraded {
+    background-color: rgba(246, 211, 45, 0.18);
+    color: #f6d32d;
+    border: 1px solid rgba(246, 211, 45, 0.4);
+}
+
+.netpulse-banner-fail {
+    background-color: rgba(224, 27, 36, 0.18);
+    color: #e01b24;
+    border: 1px solid rgba(224, 27, 36, 0.4);
+}
+
+/* Diagnostic layer rows */
+.netpulse-layer-row {
+    padding: 6px 12px;
+    margin: 2px 6px;
+    border-radius: 6px;
+    spacing: 8px;
+}
+
+.netpulse-layer-title {
+    font-weight: bold;
+    font-size: 10pt;
+}
+
+.netpulse-layer-detail {
+    font-size: 9pt;
+    color: #9a9996;
+}
+
+.netpulse-layer-badge {
+    font-size: 8.5pt;
+    font-weight: bold;
+    padding: 2px 6px;
+    border-radius: 4px;
+}

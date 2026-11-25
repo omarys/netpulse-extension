@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.netpulse" path="/org/gnome/shell/extensions/netpulse/">
+    <key name="check-interval" type="i">
+      <default>15</default>
+      <range min="5" max="3600"/>
+      <summary>Periodic check interval in seconds</summary>
+      <description>Frequency in seconds at which the background network diagnostics run.</description>
+    </key>
+    <key name="public-ip-target" type="s">
+      <default>'1.1.1.1'</default>
+      <summary>Public IP ping target</summary>
+      <description>Remote IP address used to test WAN / Internet gateway connectivity.</description>
+    </key>
+    <key name="dns-test-domain" type="s">
+      <default>'fedoraproject.org'</default>
+      <summary>DNS lookup test domain</summary>
+      <description>Domain name used to verify active DNS resolution.</description>
+    </key>
+    <key name="http-endpoint" type="s">
+      <default>'https://fedoraproject.org/static/hotspot.txt'</default>
+      <summary>HTTP endpoint for connectivity check</summary>
+      <description>HTTP/HTTPS URL checked for portal detection and end-to-end web reachability.</description>
+    </key>
+    <key name="show-latency-badge" type="b">
+      <default>true</default>
+      <summary>Show latency badge in top bar</summary>
+      <description>Whether to display average ping/HTTP latency next to the status icon in the top bar.</description>
+    </key>
+  </schema>
+</schemalist>

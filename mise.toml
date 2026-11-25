@@ -1,0 +1,91 @@
+# mise configuration for NetPulse (GNOME Shell 45+ extension)
+#
+# Expected OS-native Fedora packages (not managed by mise):
+#   - glib2 / glib2-devel  (provides `glib-compile-schemas`)
+#   - libxml2              (provides `xmllint`)
+#   - gjs                  (GNOME JavaScript runtime)
+#   - zip                  (packaging extension archives)
+#   - gnome-shell          (runtime host for the extension)
+
+[env]
+UUID = "netpulse@diagnostics.local"
+SCHEMA_DIR = "schemas"
+
+[tools]
+node = "lts"
+jq = "latest"
+pre-commit = "latest"
+python = "latest"
+
+[tasks.compile-schemas]
+description = "Compile GSettings XML schemas"
+run = 'glib-compile-schemas "$SCHEMA_DIR/"'
+
+[tasks.install]
+description = "Symlink extension into local GNOME Shell extensions directory"
+depends = ["compile-schemas"]
+run = '''
+set -euo pipefail
+INSTALL_DIR="$HOME/.local/share/gnome-shell/extensions/$UUID"
+mkdir -p "$(dirname "$INSTALL_DIR")"
+ln -sfn "$PWD" "$INSTALL_DIR"
+'''
+
+[tasks.uninstall]
+description = "Remove extension from local GNOME Shell extensions directory"
+run = 'rm -rf "$HOME/.local/share/gnome-shell/extensions/$UUID"'
+
+[tasks.pack]
+description = "Build distributable GNOME Shell extension zip archive"
+depends = ["compile-schemas"]
+run = '''
+set -euo pipefail
+ZIP_NAME="${UUID}.shell-extension.zip"
+rm -f "$ZIP_NAME"
+zip -r "$ZIP_NAME" . \
+  -x "*.git*" \
+  -x "$ZIP_NAME" \
+  -x "mise.toml" \
+  -x ".pre-commit-config.yaml" \
+  -x ".gitignore" \
+  -x "*.swp" \
+  -x "*~"
+'''
+
+[tasks.lint-json]
+description = "Validate metadata.json"
+run = "jq empty metadata.json"
+
+[tasks.lint-xml]
+description = "Validate GSettings XML schemas with xmllint and glib-compile-schemas"
+run = '''
+set -euo pipefail
+xmllint --noout "$SCHEMA_DIR"/*.gschema.xml
+glib-compile-schemas --strict --dry-run "$SCHEMA_DIR/"
+'''
+
+[tasks.lint-js]
+description = "Check JS syntax and guard against legacy GNOME 44 ExtensionUtils usage"
+run = '''
+set -euo pipefail
+for f in extension.js diagnostics.js prefs.js; do
+  node --check "$f"
+done
+if grep -En 'imports\.misc\.extensionUtils|ExtensionUtils\.getCurrentExtension' extension.js diagnostics.js prefs.js; then
+  echo "ERROR: Legacy GNOME 44 ExtensionUtils usage detected" >&2
+  exit 1
+fi
+'''
+
+[tasks.check]
+alias = "lint"
+description = "Run all JSON, XML, and JS lint checks"
+depends = ["lint-json", "lint-xml", "lint-js"]
+
+[tasks.clean]
+description = "Remove compiled schemas and packaged extension archives"
+run = 'rm -f "$SCHEMA_DIR/gschemas.compiled" *.shell-extension.zip'
+
+[tasks.hooks]
+description = "Install pre-commit git hooks"
+run = "pre-commit install"

@@ -1,0 +1,14 @@
+{
+  "uuid": "netpulse@diagnostics.local",
+  "name": "NetPulse Outage Diagnostics",
+  "description": "Layered network health diagnostics in the GNOME Top Bar: Interface, Gateway, DNS, and HTTP reachability with real-time status and latency.",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48"
+  ],
+  "settings-schema": "org.gnome.shell.extensions.netpulse",
+  "gettext-domain": "netpulse",
+  "version": 1
+}

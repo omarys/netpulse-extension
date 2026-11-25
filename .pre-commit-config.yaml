@@ -1,0 +1,34 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-json
+      - id: check-xml
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: gschema-validate
+        name: Validate GSettings XML schemas
+        entry: glib-compile-schemas --strict --dry-run schemas/
+        language: system
+        files: '^schemas/.*\.gschema\.xml$'
+        pass_filenames: false
+
+      - id: js-syntax-check
+        name: Check JavaScript syntax
+        entry: >-
+          bash -c 'for f in "$@"; do node --check "$f" || exit 1; done' --
+        language: system
+        files: '\.js$'
+
+      - id: gnome-esm-guard
+        name: Block legacy GNOME 44 ExtensionUtils usage
+        entry: >-
+          bash -c 'if grep -En "imports\.misc\.extensionUtils|ExtensionUtils\.getCurrentExtension" "$@"; then echo "ERROR: Legacy GNOME 44 ExtensionUtils usage detected" >&2; exit 1; fi' --
+        language: system
+        files: '\.js$'
