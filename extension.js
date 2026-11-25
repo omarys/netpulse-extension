@@ -12,12 +12,15 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {
+    OUTAGE_TRACE_TARGETS,
     buildNoLinkResult,
     formatLatency,
     generateDiagnosticReport,
     hasActiveNetworkLink,
     isCancelledError,
     runDiagnostics,
+    runOutageTraces,
+    runSpeedTest,
 } from './diagnostics.js';
 import {NetPulseLogger} from './logger.js';
 
@@ -56,6 +59,10 @@ const STATUS_LABEL_MAP = {
     unknown: 'PENDING',
 };
 
+const VERTICAL_BOX_PROPS = 'orientation' in St.BoxLayout.prototype
+    ? {orientation: Clutter.Orientation.VERTICAL}
+    : {vertical: true};
+
 const NetPulseIndicator = GObject.registerClass(
 class NetPulseIndicator extends PanelMenu.Button {
     _init(extension) {
@@ -93,7 +100,7 @@ class NetPulseIndicator extends PanelMenu.Button {
             can_focus: false,
         });
         this._bannerBox = new St.BoxLayout({
-            vertical: true,
+            ...VERTICAL_BOX_PROPS,
             x_expand: true,
             style_class: `netpulse-banner ${BANNER_CLASS_MAP.unknown}`,
         });
@@ -116,7 +123,7 @@ class NetPulseIndicator extends PanelMenu.Button {
             });
 
             const rowBox = new St.BoxLayout({
-                vertical: true,
+                ...VERTICAL_BOX_PROPS,
                 x_expand: true,
                 style_class: 'netpulse-layer-row',
             });
@@ -189,6 +196,26 @@ class NetPulseIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(this._copyReportItem);
 
+        this._speedTestItem = new PopupMenu.PopupMenuItem('Run Speed Test');
+        this._speedTestItem.connect('activate', () => {
+            this._extension.triggerSpeedTest();
+        });
+        this.menu.addMenuItem(this._speedTestItem);
+
+        this._speedTestResultItem = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            can_focus: false,
+        });
+        this._speedTestResultLabel = new St.Label({
+            text: '',
+            x_expand: true,
+            style_class: 'netpulse-layer-detail',
+        });
+        this._speedTestResultLabel.clutter_text.line_wrap = true;
+        this._speedTestResultItem.add_child(this._speedTestResultLabel);
+        this._speedTestResultItem.visible = false;
+        this.menu.addMenuItem(this._speedTestResultItem);
+
         this._prefsItem = new PopupMenu.PopupMenuItem('Preferences');
         this._prefsItem.connect('activate', () => {
             this._extension.openPreferences();
@@ -209,6 +236,27 @@ class NetPulseIndicator extends PanelMenu.Button {
 
     setCopyFeedback(text) {
         this._copyReportItem.label.text = text;
+    }
+
+    setSpeedTestRunning(isRunning, phaseText = null) {
+        this._speedTestItem.setSensitive(!isRunning);
+        this._speedTestItem.label.text = isRunning
+            ? (phaseText ? `Speed Test: ${phaseText}` : 'Running Speed Test...')
+            : 'Run Speed Test';
+        if (isRunning && phaseText) {
+            this._speedTestResultLabel.text = phaseText;
+            this._speedTestResultItem.visible = true;
+        }
+    }
+
+    updateSpeedTestResult(result) {
+        if (!result) {
+            this._speedTestResultItem.visible = false;
+            return;
+        }
+        const timeText = result.timestamp.toLocaleTimeString();
+        this._speedTestResultLabel.text = `${result.detail} (${timeText})`;
+        this._speedTestResultItem.visible = true;
     }
 
     updateFromResult(result) {
@@ -256,7 +304,12 @@ export default class NetPulseExtension extends Extension {
     enable() {
         this._isEnabled = true;
         this._isRunning = false;
+        this._isSpeedTestRunning = false;
+        this._isTraceRunning = false;
         this._lastResult = null;
+        this._lastSpeedTestResult = null;
+        this._lastOutageTrace = null;
+        this._lastOutageTraceReason = null;
         this._lastNotifiedSeverity = null;
         this._lastNotifiedReason = null;
         this._timerId = 0;
@@ -266,12 +319,15 @@ export default class NetPulseExtension extends Extension {
         this._nmClient = null;
         this._nmSignalIds = [];
         this._runCancellable = null;
+        this._speedTestCancellable = null;
+        this._traceCancellable = null;
         this._hasActiveLink = null;
         this._wasScreenLocked = this._isScreenLocked();
 
         this._settings = this.getSettings();
         this._cancellable = new Gio.Cancellable();
         this._soupSession = new Soup.Session({timeout: 5});
+        this._speedTestSession = new Soup.Session({timeout: 30});
         this._logger = new NetPulseLogger({
             rotationDays: this._settings.get_int('log-rotation-days'),
         });
@@ -307,6 +363,8 @@ export default class NetPulseExtension extends Extension {
         }
 
         this._cancelInFlightCheck();
+        this._cancelInFlightSpeedTest();
+        this._cancelInFlightTrace();
 
         if (this._cancellable) {
             this._cancellable.cancel();
@@ -316,6 +374,11 @@ export default class NetPulseExtension extends Extension {
         if (this._soupSession) {
             this._soupSession.abort();
             this._soupSession = null;
+        }
+
+        if (this._speedTestSession) {
+            this._speedTestSession.abort();
+            this._speedTestSession = null;
         }
 
         this._logger?.destroy();
@@ -334,11 +397,16 @@ export default class NetPulseExtension extends Extension {
         }
 
         this._lastResult = null;
+        this._lastSpeedTestResult = null;
+        this._lastOutageTrace = null;
+        this._lastOutageTraceReason = null;
         this._lastNotifiedSeverity = null;
         this._lastNotifiedReason = null;
         this._hasActiveLink = null;
         this._wasScreenLocked = false;
         this._isRunning = false;
+        this._isSpeedTestRunning = false;
+        this._isTraceRunning = false;
     }
 
     _initNmClient() {
@@ -408,6 +476,8 @@ export default class NetPulseExtension extends Extension {
         if (locked) {
             this._stopTimer();
             this._cancelInFlightCheck();
+            this._cancelInFlightSpeedTest();
+            this._cancelInFlightTrace();
         } else {
             this._evaluateLinkAndPoll(true);
         }
@@ -449,6 +519,8 @@ export default class NetPulseExtension extends Extension {
     _enterNoLinkIdle(nmStatus) {
         this._stopTimer();
         this._cancelInFlightCheck();
+        this._cancelInFlightSpeedTest();
+        this._cancelInFlightTrace();
 
         const wasAlreadyOffline = this._hasActiveLink === false;
         this._hasActiveLink = false;
@@ -469,6 +541,26 @@ export default class NetPulseExtension extends Extension {
         this._isRunning = false;
         if (this._isEnabled && this._indicator)
             this._indicator.setRunning(false);
+    }
+
+    _cancelInFlightSpeedTest() {
+        if (this._speedTestCancellable) {
+            this._speedTestCancellable.cancel();
+            this._speedTestCancellable = null;
+        }
+
+        this._isSpeedTestRunning = false;
+        if (this._isEnabled && this._indicator)
+            this._indicator.setSpeedTestRunning(false);
+    }
+
+    _cancelInFlightTrace() {
+        if (this._traceCancellable) {
+            this._traceCancellable.cancel();
+            this._traceCancellable = null;
+        }
+
+        this._isTraceRunning = false;
     }
 
     _connectSettings() {
@@ -576,6 +668,52 @@ export default class NetPulseExtension extends Extension {
                     console.error('[NetPulse] Failed to write diagnostic log:', err);
             });
         }
+
+        const severity = result?.diagnosis?.severity;
+        const message = result?.diagnosis?.message ?? '';
+        const hasInterface = result?.layers?.local?.hasInterface !== false;
+
+        if (severity === 'fail' && hasInterface) {
+            if (!this._isTraceRunning && this._lastOutageTraceReason !== message) {
+                this._lastOutageTraceReason = message;
+                this._triggerOutageTrace(message);
+            }
+        } else if (severity === 'pass') {
+            this._lastOutageTraceReason = null;
+        }
+    }
+
+    _triggerOutageTrace(reason) {
+        if (!this._isEnabled || this._isTraceRunning)
+            return;
+
+        this._isTraceRunning = true;
+        const traceCancellable = new Gio.Cancellable();
+        this._traceCancellable = traceCancellable;
+
+        runOutageTraces(OUTAGE_TRACE_TARGETS, reason, traceCancellable)
+            .then(capture => {
+                if (!this._isEnabled || traceCancellable.is_cancelled())
+                    return;
+
+                this._lastOutageTrace = capture;
+                if (this._logger) {
+                    this._logger.logOutageTrace(capture).catch(err => {
+                        if (!isCancelledError(err))
+                            console.error('[NetPulse] Failed to write outage trace log:', err);
+                    });
+                }
+            })
+            .catch(err => {
+                if (!isCancelledError(err))
+                    console.error('[NetPulse] Outage trace failed:', err);
+            })
+            .finally(() => {
+                if (this._traceCancellable === traceCancellable) {
+                    this._traceCancellable = null;
+                    this._isTraceRunning = false;
+                }
+            });
     }
 
     triggerDiagnosticsNow(force = false) {
@@ -625,11 +763,65 @@ export default class NetPulseExtension extends Extension {
             });
     }
 
+    triggerSpeedTest() {
+        if (!this._isEnabled || this._isSpeedTestRunning || !this._speedTestSession)
+            return;
+
+        this._isSpeedTestRunning = true;
+        this._indicator?.setSpeedTestRunning(true, 'Testing latency...');
+
+        const speedCancellable = new Gio.Cancellable();
+        this._speedTestCancellable = speedCancellable;
+        const speedSession = this._speedTestSession;
+
+        runSpeedTest(speedSession, speedCancellable, phase => {
+            if (!this._isEnabled || !this._indicator || speedCancellable.is_cancelled())
+                return;
+            this._indicator.setSpeedTestRunning(true, phase);
+        })
+            .then(result => {
+                if (!this._isEnabled || !this._indicator || speedCancellable.is_cancelled())
+                    return;
+                this._lastSpeedTestResult = result;
+                this._indicator.updateSpeedTestResult(result);
+            })
+            .catch(err => {
+                if (!isCancelledError(err)) {
+                    console.error('[NetPulse] Speed test failed:', err);
+                    if (this._isEnabled && this._indicator) {
+                        const failed = {
+                            ok: false,
+                            downloadMbps: null,
+                            uploadMbps: null,
+                            latencyMs: null,
+                            detail: `Speed test failed: ${err.message ?? String(err)}`,
+                            timestamp: new Date(),
+                        };
+                        this._lastSpeedTestResult = failed;
+                        this._indicator.updateSpeedTestResult(failed);
+                    }
+                }
+            })
+            .finally(() => {
+                if (this._speedTestCancellable === speedCancellable) {
+                    this._speedTestCancellable = null;
+                    this._isSpeedTestRunning = false;
+                    if (this._isEnabled && this._indicator)
+                        this._indicator.setSpeedTestRunning(false);
+                }
+            });
+    }
+
     copyDiagnosticReport() {
         if (!this._isEnabled || !this._cancellable)
             return;
 
-        generateDiagnosticReport(this._lastResult, this._cancellable)
+        generateDiagnosticReport(
+            this._lastResult,
+            this._cancellable,
+            this._lastSpeedTestResult,
+            this._lastOutageTrace
+        )
             .then(report => {
                 if (!this._isEnabled || !this._indicator)
                     return;

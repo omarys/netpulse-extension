@@ -1,2 +1,4 @@
 schemas/gschemas.compiled
 *.shell-extension.zip
+logs/
+reports/

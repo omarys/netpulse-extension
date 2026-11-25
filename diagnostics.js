@@ -3,10 +3,20 @@ import Gio from 'gi://Gio';
 import NM from 'gi://NM';
 import Soup from 'gi://Soup?version=3.0';
 
-const HIGH_LATENCY_MS = 150;
 const GATEWAY_HIGH_LATENCY_MS = 100;
+const WAN_HIGH_LATENCY_MS = 150;
+const DNS_HIGH_LATENCY_MS = 300;
+const HTTP_HIGH_LATENCY_MS = 1000;
 const DEFAULT_CMD_TIMEOUT_MS = 4000;
 const DEFAULT_HTTP_TIMEOUT_MS = 5000;
+const DEFAULT_SPEEDTEST_TIMEOUT_MS = 45000;
+const OUTAGE_TRACE_TIMEOUT_MS = 35000;
+export const OUTAGE_TRACE_TARGETS = ['1.1.1.1', '8.8.8.8'];
+const SPEEDTEST_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+const SPEEDTEST_UPLOAD_BYTES = 4 * 1024 * 1024;
+const SPEEDTEST_CHUNK_BYTES = 64 * 1024;
+const SPEEDTEST_DOWN_URL = 'https://speed.cloudflare.com/__down';
+const SPEEDTEST_UP_URL = 'https://speed.cloudflare.com/__up';
 
 /**
  * Format a latency value in milliseconds for display.
@@ -18,6 +28,20 @@ export function formatLatency(ms) {
     if (ms === null || ms === undefined || Number.isNaN(ms))
         return '--';
     return `${Math.round(ms)}ms`;
+}
+
+/**
+ * Format a throughput value in Mbps for display.
+ *
+ * @param {number|null} mbps
+ * @returns {string}
+ */
+export function formatSpeedMbps(mbps) {
+    if (mbps === null || mbps === undefined || Number.isNaN(mbps))
+        return '--';
+    if (mbps >= 100)
+        return `${Math.round(mbps)} Mbps`;
+    return `${mbps.toFixed(1)} Mbps`;
 }
 
 /**
@@ -578,7 +602,7 @@ export async function checkWanIcmp(publicIpTarget, cancellable = null) {
 
     const rttMs = parsePingRttMs(pingRes.stdout) ?? pingRes.elapsedMs;
     const roundedMs = Math.round(rttMs * 10) / 10;
-    const status = roundedMs > HIGH_LATENCY_MS ? 'degraded' : 'pass';
+    const status = roundedMs > WAN_HIGH_LATENCY_MS ? 'degraded' : 'pass';
 
     return {
         status,
@@ -653,7 +677,7 @@ export async function checkDns(dnsTestDomain, cancellable = null) {
             };
         }
 
-        const status = elapsedMs > HIGH_LATENCY_MS ? 'degraded' : 'pass';
+        const status = elapsedMs > DNS_HIGH_LATENCY_MS ? 'degraded' : 'pass';
         return {
             status,
             latencyMs: elapsedMs,
@@ -783,7 +807,7 @@ export async function checkHttpCaptivePortal(httpEndpoint, soupSession, cancella
                 };
             }
 
-            const status = elapsedMs > HIGH_LATENCY_MS ? 'degraded' : 'pass';
+            const status = elapsedMs > HTTP_HIGH_LATENCY_MS ? 'degraded' : 'pass';
             return {
                 status,
                 latencyMs: elapsedMs,
@@ -887,8 +911,8 @@ export function diagnoseLayers(layers) {
         wan.status === 'degraded' ||
         dns.status === 'degraded' ||
         http.status === 'degraded' ||
-        (wan.latencyMs !== null && wan.latencyMs > HIGH_LATENCY_MS) ||
-        (http.latencyMs !== null && http.latencyMs > HIGH_LATENCY_MS);
+        (wan.latencyMs !== null && wan.latencyMs > WAN_HIGH_LATENCY_MS) ||
+        (http.latencyMs !== null && http.latencyMs > HTTP_HIGH_LATENCY_MS);
 
     if (anyDegraded) {
         return {
@@ -934,17 +958,283 @@ export async function runDiagnostics(config, soupSession, cancellable = null, nm
 }
 
 /**
+ * Promise wrapper around Soup.Session.send_async (Soup 3.0).
+ *
+ * @param {Soup.Session} session
+ * @param {Soup.Message} message
+ * @param {Gio.Cancellable} cancellable
+ * @returns {Promise<Gio.InputStream>}
+ */
+function sendStreamAsync(session, message, cancellable) {
+    return new Promise((resolve, reject) => {
+        session.send_async(
+            message,
+            GLib.PRIORITY_DEFAULT,
+            cancellable,
+            (s, res) => {
+                try {
+                    const stream = s.send_finish(res);
+                    resolve(stream);
+                } catch (err) {
+                    reject(err);
+                }
+            }
+        );
+    });
+}
+
+/**
+ * Promise wrapper around Gio.InputStream.read_bytes_async.
+ *
+ * @param {Gio.InputStream} stream
+ * @param {number} count
+ * @param {Gio.Cancellable} cancellable
+ * @returns {Promise<GLib.Bytes>}
+ */
+function readBytesAsync(stream, count, cancellable) {
+    return new Promise((resolve, reject) => {
+        stream.read_bytes_async(
+            count,
+            GLib.PRIORITY_DEFAULT,
+            cancellable,
+            (s, res) => {
+                try {
+                    resolve(s.read_bytes_finish(res));
+                } catch (err) {
+                    reject(err);
+                }
+            }
+        );
+    });
+}
+
+/**
+ * Run an on-demand download/upload/latency speed test using Soup 3.0.
+ *
+ * @param {Soup.Session} soupSession
+ * @param {Gio.Cancellable|null} [cancellable]
+ * @param {((phase: string) => void)|null} [onProgress]
+ * @returns {Promise<{ok: boolean, downloadMbps: number|null, uploadMbps: number|null, latencyMs: number|null, detail: string, timestamp: Date}>}
+ */
+export async function runSpeedTest(soupSession, cancellable = null, onProgress = null) {
+    const scoped = createScopedCancellable(cancellable, DEFAULT_SPEEDTEST_TIMEOUT_MS);
+
+    try {
+        // 1. Latency probe (3 lightweight requests; take minimum RTT after connection setup)
+        onProgress?.('Testing latency...');
+        const rttSamples = [];
+        for (let i = 0; i < 3; i++) {
+            const pingMsg = Soup.Message.new('GET', `${SPEEDTEST_DOWN_URL}?bytes=0`);
+            const pingStartUs = GLib.get_monotonic_time();
+            await sendAndReadAsync(soupSession, pingMsg, scoped.cancellable);
+            const pingElapsedMs = (GLib.get_monotonic_time() - pingStartUs) / 1000;
+            const pingStatus = pingMsg.get_status();
+            if (pingStatus >= 200 && pingStatus < 300)
+                rttSamples.push(pingElapsedMs);
+        }
+        const latencyMs = rttSamples.length > 0
+            ? Math.min(...rttSamples)
+            : null;
+
+        // 2. Download throughput (streamed in 64 KB chunks so the payload is not buffered in RAM)
+        onProgress?.('Testing download...');
+        const downMsg = Soup.Message.new('GET', `${SPEEDTEST_DOWN_URL}?bytes=${SPEEDTEST_DOWNLOAD_BYTES}`);
+        const downStream = await sendStreamAsync(soupSession, downMsg, scoped.cancellable);
+        const downStatus = downMsg.get_status();
+        let totalDownBytes = 0;
+        const downStartUs = GLib.get_monotonic_time();
+        try {
+            if (downStatus < 200 || downStatus >= 300)
+                throw new Error(`Download failed (HTTP ${downStatus})`);
+
+            while (true) {
+                const chunk = await readBytesAsync(downStream, SPEEDTEST_CHUNK_BYTES, scoped.cancellable);
+                const size = chunk ? chunk.get_size() : 0;
+                if (size === 0)
+                    break;
+                totalDownBytes += size;
+            }
+        } finally {
+            try {
+                downStream.close(null);
+            } catch (_ignored) {
+                // Stream may already be closed.
+            }
+        }
+        const downElapsedSec = Math.max((GLib.get_monotonic_time() - downStartUs) / 1_000_000, 0.001);
+        const downloadMbps = (totalDownBytes * 8) / (downElapsedSec * 1_000_000);
+
+        // 3. Upload throughput
+        onProgress?.('Testing upload...');
+        const upMsg = Soup.Message.new('POST', SPEEDTEST_UP_URL);
+        const payload = new Uint8Array(SPEEDTEST_UPLOAD_BYTES);
+        upMsg.set_request_body_from_bytes('application/octet-stream', GLib.Bytes.new(payload));
+
+        const upStartUs = GLib.get_monotonic_time();
+        await sendAndReadAsync(soupSession, upMsg, scoped.cancellable);
+        const upElapsedSec = Math.max((GLib.get_monotonic_time() - upStartUs) / 1_000_000, 0.001);
+        const upStatus = upMsg.get_status();
+        if (upStatus < 200 || upStatus >= 300)
+            throw new Error(`Upload failed (HTTP ${upStatus})`);
+
+        const uploadMbps = (SPEEDTEST_UPLOAD_BYTES * 8) / (upElapsedSec * 1_000_000);
+
+        const parts = [
+            `↓ ${formatSpeedMbps(downloadMbps)}`,
+            `↑ ${formatSpeedMbps(uploadMbps)}`,
+        ];
+        if (latencyMs !== null)
+            parts.push(formatLatency(latencyMs));
+
+        return {
+            ok: true,
+            downloadMbps,
+            uploadMbps,
+            latencyMs,
+            detail: parts.join(' · '),
+            timestamp: new Date(),
+        };
+    } catch (err) {
+        if (cancellable?.is_cancelled() || (!scoped.isTimedOut() && isCancelledError(err)))
+            throw err;
+
+        const timedOut = scoped.isTimedOut();
+        return {
+            ok: false,
+            downloadMbps: null,
+            uploadMbps: null,
+            latencyMs: null,
+            detail: timedOut
+                ? 'Speed test timed out'
+                : `Speed test failed: ${err.message ?? String(err)}`,
+            timestamp: new Date(),
+        };
+    } finally {
+        scoped.cleanup();
+    }
+}
+
+/**
+ * Resolve the preferred route-tracing tool available on the host.
+ *
+ * @returns {{tool: 'mtr'|'traceroute'|'tracepath'|'none', buildArgv: ((target: string) => string[])|null}}
+ */
+function resolveTraceTool() {
+    const mtrPath = GLib.find_program_in_path('mtr');
+    if (mtrPath) {
+        return {
+            tool: 'mtr',
+            buildArgv: target => [mtrPath, '-rw', '-c', '10', target],
+        };
+    }
+
+    const traceroutePath = GLib.find_program_in_path('traceroute');
+    if (traceroutePath) {
+        return {
+            tool: 'traceroute',
+            buildArgv: target => [traceroutePath, '-n', '-w', '2', '-q', '2', target],
+        };
+    }
+
+    const tracepathPath = GLib.find_program_in_path('tracepath');
+    if (tracepathPath) {
+        return {
+            tool: 'tracepath',
+            buildArgv: target => [tracepathPath, '-n', target],
+        };
+    }
+
+    return {tool: 'none', buildArgv: null};
+}
+
+/**
+ * Run parallel mtr/traceroute captures to the configured DNS targets when an outage is detected.
+ *
+ * @param {string[]} [targets]
+ * @param {string} [reason]
+ * @param {Gio.Cancellable|null} [cancellable]
+ * @returns {Promise<{timestamp: Date, tool: string, reason: string, traces: Array<{target: string, ok: boolean, output: string, elapsedMs: number}>}>}
+ */
+export async function runOutageTraces(
+    targets = OUTAGE_TRACE_TARGETS,
+    reason = '',
+    cancellable = null
+) {
+    const resolved = resolveTraceTool();
+    const targetList = Array.isArray(targets) && targets.length > 0
+        ? targets
+        : OUTAGE_TRACE_TARGETS;
+
+    if (!resolved.buildArgv) {
+        return {
+            timestamp: new Date(),
+            tool: 'none',
+            reason,
+            traces: targetList.map(target => ({
+                target,
+                ok: false,
+                output: 'Neither mtr, traceroute, nor tracepath is installed',
+                elapsedMs: 0,
+            })),
+        };
+    }
+
+    const traces = await Promise.all(targetList.map(async target => {
+        const res = await runCommandAsync(resolved.buildArgv(target), {
+            timeoutMs: OUTAGE_TRACE_TIMEOUT_MS,
+            cancellable,
+        });
+        const stdout = res.stdout.trimEnd();
+        const stderr = res.stderr.trim();
+        const output = stdout.length > 0
+            ? stdout
+            : (stderr || (res.timedOut ? 'Trace timed out' : 'Trace produced no output'));
+
+        return {
+            target,
+            ok: res.ok && stdout.length > 0,
+            output,
+            elapsedMs: Math.round(res.elapsedMs),
+        };
+    }));
+
+    return {
+        timestamp: new Date(),
+        tool: resolved.tool,
+        reason,
+        traces,
+    };
+}
+
+/**
  * Generate a formatted plain-text diagnostic report including live `nmcli device status`.
  *
  * @param {{timestamp: Date, layers: {local: object, wan: object, dns: object, http: object}, diagnosis: {severity: string, message: string, shortBadge: string}}|null} result
  * @param {Gio.Cancellable|null} cancellable
+ * @param {{ok: boolean, downloadMbps: number|null, uploadMbps: number|null, latencyMs: number|null, detail: string, timestamp: Date}|null} [speedTestResult]
+ * @param {{timestamp: Date, tool: string, reason: string, traces: Array<{target: string, ok: boolean, output: string, elapsedMs: number}>}|null} [outageTrace]
  * @returns {Promise<string>}
  */
-export async function generateDiagnosticReport(result, cancellable = null) {
-    const nmcliRes = await runCommandAsync(['nmcli', 'device', 'status'], {
-        timeoutMs: 4000,
-        cancellable,
-    });
+export async function generateDiagnosticReport(
+    result,
+    cancellable = null,
+    speedTestResult = null,
+    outageTrace = null
+) {
+    const [nmcliRes, ipRouteRes, ip6RouteRes] = await Promise.all([
+        runCommandAsync(['nmcli', 'device', 'status'], {
+            timeoutMs: 4000,
+            cancellable,
+        }),
+        runCommandAsync(['ip', 'route'], {
+            timeoutMs: 4000,
+            cancellable,
+        }),
+        runCommandAsync(['ip', '-6', 'route', 'show', 'default'], {
+            timeoutMs: 4000,
+            cancellable,
+        }),
+    ]);
 
     const timestampStr = result?.timestamp
         ? result.timestamp.toISOString()
@@ -969,11 +1259,45 @@ export async function generateDiagnosticReport(result, cancellable = null) {
         lines.push('Diagnosis: No diagnostic run completed yet.');
     }
 
+    if (speedTestResult) {
+        lines.push(
+            '',
+            '--- Speed Test (Cloudflare HTTP) ---',
+            `Timestamp: ${speedTestResult.timestamp.toISOString()}`,
+            `Result   : ${speedTestResult.detail}`
+        );
+    }
+
     lines.push('', '--- NetworkManager Device Status ---');
     if (nmcliRes.ok && nmcliRes.stdout.trim().length > 0)
         lines.push(nmcliRes.stdout.trimEnd());
     else
         lines.push(`(nmcli unavailable: ${nmcliRes.stderr.trim() || 'command failed'})`);
+
+    lines.push('', '--- Routing Table (ip route) ---');
+    if (ipRouteRes.ok && ipRouteRes.stdout.trim().length > 0)
+        lines.push(ipRouteRes.stdout.trimEnd());
+    else
+        lines.push(`(ip route unavailable: ${ipRouteRes.stderr.trim() || 'command failed'})`);
+
+    if (ip6RouteRes.ok && ip6RouteRes.stdout.trim().length > 0) {
+        lines.push('', '--- IPv6 Default Route ---');
+        lines.push(ip6RouteRes.stdout.trimEnd());
+    }
+
+    if (outageTrace && Array.isArray(outageTrace.traces) && outageTrace.traces.length > 0) {
+        lines.push(
+            '',
+            `--- Outage Route Trace (${outageTrace.tool}) ---`,
+            `Captured : ${outageTrace.timestamp.toISOString()}`
+        );
+        if (outageTrace.reason)
+            lines.push(`Trigger  : ${outageTrace.reason}`);
+        for (const trace of outageTrace.traces) {
+            lines.push('', `[Target: ${trace.target}]`);
+            lines.push(trace.output);
+        }
+    }
 
     return lines.join('\n');
 }

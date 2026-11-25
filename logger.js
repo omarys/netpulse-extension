@@ -160,6 +160,44 @@ export function formatLogEntry(result) {
 }
 
 /**
+ * Format an outage mtr/traceroute capture into a single newline-terminated JSONL log line.
+ *
+ * @param {{timestamp?: Date|string|number, tool?: string, reason?: string, traces?: Array<{target: string, ok: boolean, output: string, elapsedMs: number}>}|null|undefined} traceCapture
+ * @returns {string}
+ */
+export function formatOutageTraceEntry(traceCapture) {
+    let timestamp;
+    const rawTs = traceCapture?.timestamp;
+    if (rawTs instanceof Date && !Number.isNaN(rawTs.getTime()))
+        timestamp = rawTs.toISOString();
+    else if (typeof rawTs === 'string' && rawTs.trim().length > 0)
+        timestamp = rawTs.trim();
+    else if (typeof rawTs === 'number' && Number.isFinite(rawTs))
+        timestamp = new Date(rawTs).toISOString();
+    else
+        timestamp = new Date().toISOString();
+
+    const entry = {
+        type: 'outage_trace',
+        timestamp,
+        tool: typeof traceCapture?.tool === 'string' ? traceCapture.tool : 'unknown',
+        reason: typeof traceCapture?.reason === 'string' ? traceCapture.reason : '',
+        traces: Array.isArray(traceCapture?.traces)
+            ? traceCapture.traces.map(t => ({
+                target: typeof t?.target === 'string' ? t.target : '',
+                ok: Boolean(t?.ok),
+                elapsedMs: typeof t?.elapsedMs === 'number' && Number.isFinite(t.elapsedMs)
+                    ? t.elapsedMs
+                    : 0,
+                output: typeof t?.output === 'string' ? t.output : '',
+            }))
+            : [],
+    };
+
+    return `${JSON.stringify(entry)}\n`;
+}
+
+/**
  * Format an archive filename for a given epoch timestamp in milliseconds:
  * `netpulse-YYYY-MM-DD_HHMMSS.log`.
  *
@@ -617,7 +655,22 @@ export class NetPulseLogger {
         if (this._destroyed || this._cancellable.is_cancelled())
             return;
 
-        const task = this._writeQueue.then(() => this._writeEntry(result));
+        const task = this._writeQueue.then(() => this._writeFormattedLine(formatLogEntry(result)));
+        this._writeQueue = task.catch(() => {});
+        return task;
+    }
+
+    /**
+     * Serialize and asynchronously append an outage mtr/traceroute capture to the active log file.
+     *
+     * @param {object} traceCapture
+     * @returns {Promise<void>}
+     */
+    async logOutageTrace(traceCapture) {
+        if (this._destroyed || this._cancellable.is_cancelled())
+            return;
+
+        const task = this._writeQueue.then(() => this._writeFormattedLine(formatOutageTraceEntry(traceCapture)));
         this._writeQueue = task.catch(() => {});
         return task;
     }
@@ -717,12 +770,12 @@ export class NetPulseLogger {
     }
 
     /**
-     * Internal serialized write path: ensure directory, check/perform rotation, append entry.
+     * Internal serialized write path: ensure directory, check/perform rotation, append line.
      *
-     * @param {object} result
+     * @param {string} line
      * @returns {Promise<void>}
      */
-    async _writeEntry(result) {
+    async _writeFormattedLine(line) {
         if (this._destroyed || this._cancellable.is_cancelled())
             return;
 
@@ -763,7 +816,6 @@ export class NetPulseLogger {
             if (this._destroyed || this._cancellable.is_cancelled())
                 return;
 
-            const line = formatLogEntry(result);
             await appendTextFileAsync(this._activeLogFile, line, this._cancellable);
         } catch (err) {
             if (this._destroyed || this._cancellable.is_cancelled() || isCancelledError(err))
