@@ -29,11 +29,46 @@ set -euo pipefail
 INSTALL_DIR="$HOME/.local/share/gnome-shell/extensions/$UUID"
 mkdir -p "$(dirname "$INSTALL_DIR")"
 ln -sfn "$PWD" "$INSTALL_DIR"
+echo "Installed extension symlink: $INSTALL_DIR -> $PWD"
+'''
+
+[tasks.enable]
+description = "Enable the extension in GNOME Shell"
+run = '''
+set -euo pipefail
+if ! gnome-extensions enable "$UUID"; then
+  echo "Failed to enable $UUID in GNOME Shell." >&2
+  echo "Hint: On Wayland, GNOME Shell does not automatically discover newly installed extensions." >&2
+  echo "Try logging out and back in, or test in a nested Wayland session (e.g. 'dbus-run-session -- gnome-shell --nested --wayland')." >&2
+  exit 1
+fi
+'''
+
+[tasks.disable]
+description = "Disable the extension in GNOME Shell"
+run = 'gnome-extensions disable "$UUID"'
+
+[tasks.install-enable]
+description = "Install (symlink) and enable the extension in GNOME Shell"
+depends = ["install"]
+run = '''
+set -euo pipefail
+if ! gnome-extensions enable "$UUID"; then
+  echo "Failed to enable $UUID in GNOME Shell." >&2
+  echo "Hint: On Wayland, GNOME Shell does not automatically discover newly installed extensions." >&2
+  echo "Try logging out and back in, or test in a nested Wayland session (e.g. 'dbus-run-session -- gnome-shell --nested --wayland')." >&2
+  exit 1
+fi
 '''
 
 [tasks.uninstall]
 description = "Remove extension from local GNOME Shell extensions directory"
-run = 'rm -rf "$HOME/.local/share/gnome-shell/extensions/$UUID"'
+run = '''
+set -euo pipefail
+gnome-extensions disable "$UUID" 2>/dev/null || true
+rm -rf "$HOME/.local/share/gnome-shell/extensions/$UUID"
+echo "Uninstalled extension $UUID"
+'''
 
 [tasks.pack]
 description = "Build distributable GNOME Shell extension zip archive"
