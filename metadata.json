@@ -2,7 +2,7 @@
   "uuid": "netpulse@omary.github.io",
   "name": "NetPulse Outage Diagnostics",
   "url": "https://github.com/omarys/netpulse-extension",
-  "description": "Layered network health diagnostics in the GNOME Top Bar: Interface, Gateway, DNS, and HTTP reachability with real-time status and latency.",
+  "description": "Layered network health diagnostics in the GNOME Top Bar: Interface, Gateway, DNS, and HTTP reachability with real-time status, latency, automatic outage route traces, speed tests, and one-click copy of diagnostic reports to the clipboard.",
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
   "settings-schema": "org.gnome.shell.extensions.netpulse",
   "gettext-domain": "netpulse"

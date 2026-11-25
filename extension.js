@@ -409,6 +409,10 @@ export default class NetPulseExtension extends Extension {
         this._isTraceRunning = false;
     }
 
+    _logError(message, err) {
+        console.error(`[NetPulse] ${message}:`, err);
+    }
+
     _initNmClient() {
         NM.Client.new_async(this._cancellable, (_obj, res) => {
             try {
@@ -421,7 +425,7 @@ export default class NetPulseExtension extends Extension {
                 this._evaluateLinkAndPoll(true);
             } catch (err) {
                 if (!isCancelledError(err)) {
-                    console.error('[NetPulse] Failed to initialize NM.Client:', err);
+                    this._logError('Failed to initialize NM.Client', err);
                     if (this._isEnabled && !this._isScreenLocked()) {
                         this._startTimer();
                         this.triggerDiagnosticsNow();
@@ -665,7 +669,7 @@ export default class NetPulseExtension extends Extension {
         if (this._logger) {
             this._logger.logDiagnostic(result).catch(err => {
                 if (!isCancelledError(err))
-                    console.error('[NetPulse] Failed to write diagnostic log:', err);
+                    this._logError('Failed to write diagnostic log', err);
             });
         }
 
@@ -700,13 +704,13 @@ export default class NetPulseExtension extends Extension {
                 if (this._logger) {
                     this._logger.logOutageTrace(capture).catch(err => {
                         if (!isCancelledError(err))
-                            console.error('[NetPulse] Failed to write outage trace log:', err);
+                            this._logError('Failed to write outage trace log', err);
                     });
                 }
             })
             .catch(err => {
                 if (!isCancelledError(err))
-                    console.error('[NetPulse] Outage trace failed:', err);
+                    this._logError('Outage trace failed', err);
             })
             .finally(() => {
                 if (this._traceCancellable === traceCancellable) {
@@ -751,7 +755,7 @@ export default class NetPulseExtension extends Extension {
             })
             .catch(err => {
                 if (!isCancelledError(err))
-                    console.error('[NetPulse] Diagnostics failed:', err);
+                    this._logError('Diagnostics failed', err);
             })
             .finally(() => {
                 if (this._runCancellable === runCancellable) {
@@ -787,7 +791,7 @@ export default class NetPulseExtension extends Extension {
             })
             .catch(err => {
                 if (!isCancelledError(err)) {
-                    console.error('[NetPulse] Speed test failed:', err);
+                    this._logError('Speed test failed', err);
                     if (this._isEnabled && this._indicator) {
                         const failed = {
                             ok: false,
@@ -847,7 +851,7 @@ export default class NetPulseExtension extends Extension {
             })
             .catch(err => {
                 if (!isCancelledError(err))
-                    console.error('[NetPulse] Failed to generate diagnostic report:', err);
+                    this._logError('Failed to generate diagnostic report', err);
             });
     }
 }
