@@ -27,5 +27,16 @@
       <summary>Show latency badge in top bar</summary>
       <description>Whether to display average ping/HTTP latency next to the status icon in the top bar.</description>
     </key>
+    <key name="notify-on-outage" type="b">
+      <default>true</default>
+      <summary>Notify on network outage</summary>
+      <description>Raise a desktop notification when a network outage occurs or recovers.</description>
+    </key>
+    <key name="log-rotation-days" type="i">
+      <default>3</default>
+      <range min="1" max="90"/>
+      <summary>Log rotation interval in days</summary>
+      <description>Number of days before rotating diagnostic log files.</description>
+    </key>
   </schema>
 </schemalist>

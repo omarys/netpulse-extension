@@ -68,10 +68,10 @@ glib-compile-schemas --strict --dry-run "$SCHEMA_DIR/"
 description = "Check JS syntax and guard against legacy GNOME 44 ExtensionUtils usage"
 run = '''
 set -euo pipefail
-for f in extension.js diagnostics.js prefs.js; do
+for f in extension.js diagnostics.js logger.js prefs.js; do
   node --check "$f"
 done
-if grep -En 'imports\.misc\.extensionUtils|ExtensionUtils\.getCurrentExtension' extension.js diagnostics.js prefs.js; then
+if grep -En 'imports\.misc\.extensionUtils|ExtensionUtils\.getCurrentExtension' extension.js diagnostics.js logger.js prefs.js; then
   echo "ERROR: Legacy GNOME 44 ExtensionUtils usage detected" >&2
   exit 1
 fi

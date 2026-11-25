@@ -9,6 +9,8 @@ const SETTING_KEYS = [
     'public-ip-target',
     'dns-test-domain',
     'http-endpoint',
+    'notify-on-outage',
+    'log-rotation-days',
 ];
 
 export default class NetPulsePreferences extends ExtensionPreferences {
@@ -104,7 +106,46 @@ export default class NetPulsePreferences extends ExtensionPreferences {
         );
         targetsGroup.add(httpEndpointRow);
 
-        // Group 3: Reset
+        // Group 3: Notifications & Logging
+        const notificationsLoggingGroup = new Adw.PreferencesGroup({
+            title: _('Notifications & Logging'),
+            description: _('Configure outage desktop notifications and diagnostic log retention.'),
+        });
+        page.add(notificationsLoggingGroup);
+
+        const notifyOutageRow = new Adw.SwitchRow({
+            title: _('Notify on Network Outage'),
+            subtitle: _('Show a desktop notification when a network outage occurs or connectivity recovers'),
+        });
+        settings.bind(
+            'notify-on-outage',
+            notifyOutageRow,
+            'active',
+            Gio.SettingsBindFlags.DEFAULT
+        );
+        notificationsLoggingGroup.add(notifyOutageRow);
+
+        const logRotationRow = new Adw.SpinRow({
+            title: _('Log Rotation Interval (days)'),
+            subtitle: _('Number of days before rotating diagnostic log files (1–90 days)'),
+            adjustment: new Gtk.Adjustment({
+                lower: 1,
+                upper: 90,
+                step_increment: 1,
+                page_increment: 7,
+                value: settings.get_int('log-rotation-days'),
+            }),
+            numeric: true,
+        });
+        settings.bind(
+            'log-rotation-days',
+            logRotationRow,
+            'value',
+            Gio.SettingsBindFlags.DEFAULT
+        );
+        notificationsLoggingGroup.add(logRotationRow);
+
+        // Group 4: Reset
         const resetGroup = new Adw.PreferencesGroup({
             title: _('Reset'),
         });
@@ -112,7 +153,7 @@ export default class NetPulsePreferences extends ExtensionPreferences {
 
         const resetRow = new Adw.ActionRow({
             title: _('Reset to Defaults'),
-            subtitle: _('Restore all monitoring options and diagnostic targets to default values'),
+            subtitle: _('Restore all monitoring options, diagnostic targets, and notification settings to default values'),
         });
 
         const resetButton = new Gtk.Button({
@@ -128,6 +169,8 @@ export default class NetPulsePreferences extends ExtensionPreferences {
                 'public-ip-target': settings.get_string('public-ip-target'),
                 'dns-test-domain': settings.get_string('dns-test-domain'),
                 'http-endpoint': settings.get_string('http-endpoint'),
+                'notify-on-outage': settings.get_boolean('notify-on-outage'),
+                'log-rotation-days': settings.get_int('log-rotation-days'),
             };
 
             for (const key of SETTING_KEYS)
@@ -144,6 +187,8 @@ export default class NetPulsePreferences extends ExtensionPreferences {
                 settings.set_string('public-ip-target', previous['public-ip-target']);
                 settings.set_string('dns-test-domain', previous['dns-test-domain']);
                 settings.set_string('http-endpoint', previous['http-endpoint']);
+                settings.set_boolean('notify-on-outage', previous['notify-on-outage']);
+                settings.set_int('log-rotation-days', previous['log-rotation-days']);
             });
             window.add_toast(toast);
         });

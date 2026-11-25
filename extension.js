@@ -16,6 +16,7 @@ import {
     isCancelledError,
     runDiagnostics,
 } from './diagnostics.js';
+import {NetPulseLogger} from './logger.js';
 
 const LAYER_DEFINITIONS = [
     {key: 'local', title: 'Local Interface & Gateway'},
@@ -253,6 +254,8 @@ export default class NetPulseExtension extends Extension {
         this._isEnabled = true;
         this._isRunning = false;
         this._lastResult = null;
+        this._lastNotifiedSeverity = null;
+        this._lastNotifiedReason = null;
         this._timerId = 0;
         this._copyFeedbackTimerId = 0;
         this._settingsHandlerIds = [];
@@ -260,6 +263,9 @@ export default class NetPulseExtension extends Extension {
         this._settings = this.getSettings();
         this._cancellable = new Gio.Cancellable();
         this._soupSession = new Soup.Session({timeout: 5});
+        this._logger = new NetPulseLogger({
+            rotationDays: this._settings.get_int('log-rotation-days'),
+        });
 
         this._indicator = new NetPulseIndicator(this);
         this._indicator.setBadgeVisible(this._settings.get_boolean('show-latency-badge'));
@@ -293,6 +299,9 @@ export default class NetPulseExtension extends Extension {
             this._soupSession = null;
         }
 
+        this._logger?.destroy();
+        this._logger = null;
+
         if (this._settings) {
             for (const id of this._settingsHandlerIds)
                 this._settings.disconnect(id);
@@ -306,6 +315,8 @@ export default class NetPulseExtension extends Extension {
         }
 
         this._lastResult = null;
+        this._lastNotifiedSeverity = null;
+        this._lastNotifiedReason = null;
         this._isRunning = false;
     }
 
@@ -319,6 +330,11 @@ export default class NetPulseExtension extends Extension {
                 this._indicator.setBadgeVisible(this._settings.get_boolean('show-latency-badge'));
         });
 
+        const onLogRotationDaysChanged = this._settings.connect('changed::log-rotation-days', () => {
+            if (this._logger && this._settings)
+                this._logger.setRotationDays(this._settings.get_int('log-rotation-days'));
+        });
+
         const onTargetChanged = () => {
             this.triggerDiagnosticsNow();
         };
@@ -330,6 +346,7 @@ export default class NetPulseExtension extends Extension {
         this._settingsHandlerIds.push(
             onIntervalChanged,
             onShowBadgeChanged,
+            onLogRotationDaysChanged,
             onPublicIpChanged,
             onDnsChanged,
             onHttpChanged
@@ -364,6 +381,31 @@ export default class NetPulseExtension extends Extension {
         };
     }
 
+    _handleOutageNotification(result) {
+        const diagnosis = result?.diagnosis;
+        if (!diagnosis)
+            return;
+
+        const notifyEnabled = this._settings ? this._settings.get_boolean('notify-on-outage') : false;
+
+        if (diagnosis.severity === 'fail') {
+            if (this._lastNotifiedSeverity !== 'fail' || this._lastNotifiedReason !== diagnosis.message) {
+                if (notifyEnabled)
+                    Main.notify('NetPulse: Network Outage Detected', diagnosis.message);
+                this._lastNotifiedSeverity = 'fail';
+                this._lastNotifiedReason = diagnosis.message;
+            }
+        } else if (diagnosis.severity === 'pass' && this._lastNotifiedSeverity === 'fail') {
+            if (notifyEnabled)
+                Main.notify('NetPulse: Connection Restored', diagnosis.message);
+            this._lastNotifiedSeverity = 'pass';
+            this._lastNotifiedReason = null;
+        } else if (diagnosis.severity === 'degraded' && this._lastNotifiedSeverity !== 'fail') {
+            this._lastNotifiedSeverity = 'degraded';
+            this._lastNotifiedReason = null;
+        }
+    }
+
     triggerDiagnosticsNow() {
         if (!this._isEnabled || this._isRunning || !this._settings || !this._soupSession)
             return;
@@ -381,6 +423,13 @@ export default class NetPulseExtension extends Extension {
                     return;
                 this._lastResult = result;
                 this._indicator.updateFromResult(result);
+                this._handleOutageNotification(result);
+                if (this._logger) {
+                    this._logger.logDiagnostic(result).catch(err => {
+                        if (!isCancelledError(err))
+                            console.error('[NetPulse] Failed to write diagnostic log:', err);
+                    });
+                }
             })
             .catch(err => {
                 if (!isCancelledError(err))
