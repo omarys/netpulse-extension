@@ -8,7 +8,7 @@
 #   - gnome-shell          (runtime host for the extension)
 
 [env]
-UUID = "netpulse@diagnostics.local"
+UUID = "netpulse@omary.github.io"
 SCHEMA_DIR = "schemas"
 
 [tools]
